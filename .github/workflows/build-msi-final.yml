@@ -48,7 +48,7 @@ jobs:
           if (-not (Test-Path "$env:GITHUB_WORKSPACE\work\AssemblyNetStudio\AssemblyNetStudio.sln")) { throw 'Recovered source layout invalid.' }
           Write-Host "Recovered source verified: $sha"
 
-      - name: Apply tested frozen-engine fixes
+      - name: Apply tested packaging and WPF compile fixes
         shell: pwsh
         working-directory: work/AssemblyNetStudio
         run: |
@@ -67,7 +67,22 @@ jobs:
           if ((Get-Content -Raw $spec) -notmatch [regex]::Escape($newRoot)) { throw 'Spec root fix verification failed.' }
           if ((Get-Content -Raw $spec) -notmatch [regex]::Escape($newEntry)) { throw 'Spec entrypoint fix verification failed.' }
           if (-not (Test-Path 'engine\packaging\engine_entry.py')) { throw 'Package-aware engine entrypoint missing.' }
-          Write-Host 'Frozen-engine fixes staged and verified.'
+
+          $vm = 'src\AssemblyNetStudio.App\ViewModels\MainWindowViewModel.cs'
+          $vmText = Get-Content -Raw $vm
+          if ($vmText -notmatch '(?m)^using System\.IO;\s*$') {
+            $vmText = "using System.IO;`r`n" + $vmText
+            [IO.File]::WriteAllText((Resolve-Path $vm), $vmText, (New-Object Text.UTF8Encoding($false)))
+          }
+          if ((Get-Content -Raw $vm) -notmatch '(?m)^using System\.IO;\s*$') { throw 'WPF System.IO import fix verification failed.' }
+          Write-Host 'Packaging and WPF compile fixes staged and verified.'
+
+      - name: Preflight WPF compile
+        shell: pwsh
+        working-directory: work/AssemblyNetStudio
+        run: |
+          dotnet build '.\src\AssemblyNetStudio.App\AssemblyNetStudio.App.csproj' -c Release -p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { throw 'WPF preflight compile failed.' }
 
       - name: Acquire MNI305 template and provenance
         shell: pwsh
