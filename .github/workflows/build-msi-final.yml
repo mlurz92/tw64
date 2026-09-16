@@ -48,7 +48,7 @@ jobs:
           if (-not (Test-Path "$env:GITHUB_WORKSPACE\work\AssemblyNetStudio\AssemblyNetStudio.sln")) { throw 'Recovered source layout invalid.' }
           Write-Host "Recovered source verified: $sha"
 
-      - name: Apply tested packaging and WPF compile fixes
+      - name: Apply tested packaging, WPF, and installer fixes
         shell: pwsh
         working-directory: work/AssemblyNetStudio
         run: |
@@ -75,7 +75,16 @@ jobs:
             [IO.File]::WriteAllText((Resolve-Path $vm), $vmText, (New-Object Text.UTF8Encoding($false)))
           }
           if ((Get-Content -Raw $vm) -notmatch '(?m)^using System\.IO;\s*$') { throw 'WPF System.IO import fix verification failed.' }
-          Write-Host 'Packaging and WPF compile fixes staged and verified.'
+
+          $installerScript = 'scripts\build-installer.ps1'
+          $installerText = Get-Content -Raw $installerScript
+          $oldWixPin = 'dotnet tool install wix --version 7.0.0 --tool-path $ToolDir'
+          $newWixPin = 'dotnet tool install wix --version 5.0.2 --tool-path $ToolDir'
+          if (-not $installerText.Contains($oldWixPin)) { throw 'Expected WiX 7 installer pin not found.' }
+          $installerText = $installerText.Replace($oldWixPin, $newWixPin)
+          [IO.File]::WriteAllText((Resolve-Path $installerScript), $installerText, (New-Object Text.UTF8Encoding($false)))
+          if ((Get-Content -Raw $installerScript) -notmatch 'wix --version 5\.0\.2') { throw 'WiX 5 installer pin fix verification failed.' }
+          Write-Host 'Packaging, WPF compile, and WiX 5 installer fixes staged and verified.'
 
       - name: Preflight WPF compile
         shell: pwsh
@@ -84,20 +93,24 @@ jobs:
           dotnet build '.\src\AssemblyNetStudio.App\AssemblyNetStudio.App.csproj' -c Release -p:Platform=x64
           if ($LASTEXITCODE -ne 0) { throw 'WPF preflight compile failed.' }
 
-      - name: Accept WiX 7 EULA and preflight toolchain
+      - name: Preflight WiX 5 installer compiler
         shell: pwsh
         working-directory: work/AssemblyNetStudio
         run: |
-          $toolDir = '.tools\wix-preflight'
+          $toolDir = '.tools\wix'
           New-Item -ItemType Directory -Force $toolDir | Out-Null
-          dotnet tool install wix --version 7.0.0 --tool-path $toolDir
-          if ($LASTEXITCODE -ne 0) { throw 'WiX 7.0.0 tool install failed.' }
+          dotnet tool install wix --version 5.0.2 --tool-path $toolDir
+          if ($LASTEXITCODE -ne 0) { throw 'WiX 5.0.2 tool install failed.' }
           $wix = Join-Path $toolDir 'wix.exe'
           $version = & $wix --version
-          if ($LASTEXITCODE -ne 0 -or ($version -join '') -notmatch '^7\.0\.0') { throw "Unexpected WiX version: $version" }
-          & $wix eula accept wix7
-          if ($LASTEXITCODE -ne 0) { throw 'WiX 7 EULA acceptance failed.' }
-          Write-Host "WiX preflight: $version; EULA wix7 accepted for this runner user."
+          if ($LASTEXITCODE -ne 0 -or ($version -join '') -notmatch '^5\.0\.2') { throw "Unexpected WiX version: $version" }
+          $tempRoot = Join-Path $env:RUNNER_TEMP 'wix-preflight-root'
+          New-Item -ItemType Directory -Force $tempRoot | Out-Null
+          Set-Content -Encoding ascii (Join-Path $tempRoot 'preflight.txt') 'preflight'
+          $tempMsi = Join-Path $env:RUNNER_TEMP 'AssemblyNetStudio-preflight.msi'
+          & $wix build '.\installer\Product.wxs' -arch x64 -d "ReleaseRoot=$tempRoot" -out $tempMsi
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tempMsi)) { throw 'WiX 5 Product.wxs preflight compile failed.' }
+          Write-Host "WiX preflight compiler: $version"
 
       - name: Acquire MNI305 template and provenance
         shell: pwsh
@@ -148,6 +161,7 @@ jobs:
           if ($cap.protocolVersion -ne 1 -or $cap.labelCount -ne 133 -or $cap.engineName -ne 'MONAI WholeBrain UNesT' -or -not $cap.cpuSupported -or -not $cap.researchUseOnly -or $cap.originalAssemblyNetRuntime) { throw 'Installed engine capability contract failed.' }
           $capRaw | Set-Content -Encoding utf8 '.\dist\installed-engine-capabilities.json'
           & $dcm -v 2>&1 | Tee-Object -FilePath (Join-Path $env:RUNNER_TEMP 'dcm2niix-version.txt')
+          if ($LASTEXITCODE -ne 0) { throw "Installed dcm2niix version check exited $LASTEXITCODE" }
           $u = Start-Process msiexec.exe -ArgumentList @('/x', ('"' + $msi + '"'), '/qn', '/norestart', '/l*v', ('"' + $uninstallLog + '"')) -Wait -PassThru
           if ($u.ExitCode -notin @(0,3010)) { Get-Content $uninstallLog -Tail 250; throw "MSI uninstall failed with $($u.ExitCode)" }
           if (Test-Path $app) { throw 'MSI uninstall left application executable behind.' }
