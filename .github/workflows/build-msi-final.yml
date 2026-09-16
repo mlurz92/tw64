@@ -48,7 +48,7 @@ jobs:
           if (-not (Test-Path "$env:GITHUB_WORKSPACE\work\AssemblyNetStudio\AssemblyNetStudio.sln")) { throw 'Recovered source layout invalid.' }
           Write-Host "Recovered source verified: $sha"
 
-      - name: Apply tested packaging and WPF compile fixes
+      - name: Apply tested packaging WPF and installer fixes
         shell: pwsh
         working-directory: work/AssemblyNetStudio
         run: |
@@ -75,7 +75,14 @@ jobs:
             [IO.File]::WriteAllText((Resolve-Path $vm), $vmText, (New-Object Text.UTF8Encoding($false)))
           }
           if ((Get-Content -Raw $vm) -notmatch '(?m)^using System\.IO;\s*$') { throw 'WPF System.IO import fix verification failed.' }
-          Write-Host 'Packaging and WPF compile fixes staged and verified.'
+
+          $installerScript = 'scripts\build-installer.ps1'
+          $installerText = Get-Content -Raw $installerScript
+          if (-not $installerText.Contains('dotnet tool install wix --version 7.0.0 --tool-path $ToolDir')) { throw 'Expected WiX 7 installer command not found.' }
+          $installerText = $installerText.Replace('dotnet tool install wix --version 7.0.0 --tool-path $ToolDir','dotnet tool install wix --version 5.0.2 --tool-path $ToolDir')
+          [IO.File]::WriteAllText((Resolve-Path $installerScript), $installerText, (New-Object Text.UTF8Encoding($false)))
+          if ((Get-Content -Raw $installerScript) -notmatch 'wix --version 5\.0\.2') { throw 'WiX 5.0.2 pin verification failed.' }
+          Write-Host 'Packaging, WPF, and WiX 5.0.2 installer fixes staged and verified.'
 
       - name: Preflight WPF compile
         shell: pwsh
@@ -83,6 +90,18 @@ jobs:
         run: |
           dotnet build '.\src\AssemblyNetStudio.App\AssemblyNetStudio.App.csproj' -c Release -p:Platform=x64
           if ($LASTEXITCODE -ne 0) { throw 'WPF preflight compile failed.' }
+
+      - name: Preflight WiX 5 toolchain
+        shell: pwsh
+        working-directory: work/AssemblyNetStudio
+        run: |
+          $toolDir = '.tools\wix-preflight'
+          New-Item -ItemType Directory -Force $toolDir | Out-Null
+          dotnet tool install wix --version 5.0.2 --tool-path $toolDir
+          if ($LASTEXITCODE -ne 0) { throw 'WiX 5.0.2 tool install failed.' }
+          $version = & (Join-Path $toolDir 'wix.exe') --version
+          if ($LASTEXITCODE -ne 0 -or ($version -join '') -notmatch '^5\.0\.2') { throw "Unexpected WiX version: $version" }
+          Write-Host "WiX preflight: $version"
 
       - name: Acquire MNI305 template and provenance
         shell: pwsh
