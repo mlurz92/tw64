@@ -160,8 +160,12 @@ jobs:
           $cap = $capRaw | ConvertFrom-Json
           if ($cap.protocolVersion -ne 1 -or $cap.labelCount -ne 133 -or $cap.engineName -ne 'MONAI WholeBrain UNesT' -or -not $cap.cpuSupported -or -not $cap.researchUseOnly -or $cap.originalAssemblyNetRuntime) { throw 'Installed engine capability contract failed.' }
           $capRaw | Set-Content -Encoding utf8 '.\dist\installed-engine-capabilities.json'
-          & $dcm -v 2>&1 | Tee-Object -FilePath (Join-Path $env:RUNNER_TEMP 'dcm2niix-version.txt')
-          if ($LASTEXITCODE -ne 0) { throw "Installed dcm2niix version check exited $LASTEXITCODE" }
+          $dcmOutput = (& $dcm -v 2>&1 | Out-String)
+          $dcmExit = $LASTEXITCODE
+          $dcmOutput | Set-Content -Encoding utf8 '.\dist\dcm2niix-version.txt'
+          Write-Host $dcmOutput
+          Write-Host "dcm2niix -v exit=$dcmExit"
+          if ($dcmOutput -notmatch 'v1\.0\.20260724') { throw 'Installed dcm2niix version output mismatch.' }
           $u = Start-Process msiexec.exe -ArgumentList @('/x', ('"' + $msi + '"'), '/qn', '/norestart', '/l*v', ('"' + $uninstallLog + '"')) -Wait -PassThru
           if ($u.ExitCode -notin @(0,3010)) { Get-Content $uninstallLog -Tail 250; throw "MSI uninstall failed with $($u.ExitCode)" }
           if (Test-Path $app) { throw 'MSI uninstall left application executable behind.' }
@@ -179,6 +183,7 @@ jobs:
             work/AssemblyNetStudio/dist/SHA256SUMS
             work/AssemblyNetStudio/dist/engine-capabilities.json
             work/AssemblyNetStudio/dist/installed-engine-capabilities.json
+            work/AssemblyNetStudio/dist/dcm2niix-version.txt
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
