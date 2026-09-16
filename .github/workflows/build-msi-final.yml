@@ -48,7 +48,7 @@ jobs:
           if (-not (Test-Path "$env:GITHUB_WORKSPACE\work\AssemblyNetStudio\AssemblyNetStudio.sln")) { throw 'Recovered source layout invalid.' }
           Write-Host "Recovered source verified: $sha"
 
-      - name: Apply tested packaging, WPF, and installer fixes
+      - name: Apply tested packaging, WPF, and WiX 7 EULA fixes
         shell: pwsh
         working-directory: work/AssemblyNetStudio
         run: |
@@ -78,13 +78,14 @@ jobs:
 
           $installerScript = 'scripts\build-installer.ps1'
           $installerText = Get-Content -Raw $installerScript
-          $oldWixPin = 'dotnet tool install wix --version 7.0.0 --tool-path $ToolDir'
-          $newWixPin = 'dotnet tool install wix --version 5.0.2 --tool-path $ToolDir'
-          if (-not $installerText.Contains($oldWixPin)) { throw 'Expected WiX 7 installer pin not found.' }
-          $installerText = $installerText.Replace($oldWixPin, $newWixPin)
+          $wixInstall = 'dotnet tool install wix --version 7.0.0 --tool-path $ToolDir'
+          if (-not $installerText.Contains($wixInstall)) { throw 'Expected WiX 7 installer pin not found.' }
+          $wixInstallWithEula = "$wixInstall`r`n& (Join-Path `$ToolDir 'wix.exe') eula accept wix7`r`nif (`$LASTEXITCODE -ne 0) { throw 'WiX 7 OSMF EULA acceptance failed.' }"
+          $installerText = $installerText.Replace($wixInstall, $wixInstallWithEula)
           [IO.File]::WriteAllText((Resolve-Path $installerScript), $installerText, (New-Object Text.UTF8Encoding($false)))
-          if ((Get-Content -Raw $installerScript) -notmatch 'wix --version 5\.0\.2') { throw 'WiX 5 installer pin fix verification failed.' }
-          Write-Host 'Packaging, WPF compile, and WiX 5 installer fixes staged and verified.'
+          $installerVerify = Get-Content -Raw $installerScript
+          if ($installerVerify -notmatch 'wix --version 7\.0\.0' -or $installerVerify -notmatch 'eula accept wix7') { throw 'WiX 7 EULA installer patch verification failed.' }
+          Write-Host 'Packaging, WPF compile, and WiX 7 EULA fixes staged and verified.'
 
       - name: Preflight WPF compile
         shell: pwsh
@@ -93,24 +94,26 @@ jobs:
           dotnet build '.\src\AssemblyNetStudio.App\AssemblyNetStudio.App.csproj' -c Release -p:Platform=x64
           if ($LASTEXITCODE -ne 0) { throw 'WPF preflight compile failed.' }
 
-      - name: Preflight WiX 5 installer compiler
+      - name: Preflight WiX 7 EULA and installer compiler
         shell: pwsh
         working-directory: work/AssemblyNetStudio
         run: |
-          $toolDir = '.tools\wix'
+          $toolDir = '.tools\wix-preflight'
           New-Item -ItemType Directory -Force $toolDir | Out-Null
-          dotnet tool install wix --version 5.0.2 --tool-path $toolDir
-          if ($LASTEXITCODE -ne 0) { throw 'WiX 5.0.2 tool install failed.' }
+          dotnet tool install wix --version 7.0.0 --tool-path $toolDir
+          if ($LASTEXITCODE -ne 0) { throw 'WiX 7.0.0 tool install failed.' }
           $wix = Join-Path $toolDir 'wix.exe'
+          & $wix eula accept wix7
+          if ($LASTEXITCODE -ne 0) { throw 'WiX 7 OSMF EULA preflight acceptance failed.' }
           $version = & $wix --version
-          if ($LASTEXITCODE -ne 0 -or ($version -join '') -notmatch '^5\.0\.2') { throw "Unexpected WiX version: $version" }
+          if ($LASTEXITCODE -ne 0 -or ($version -join '') -notmatch '^7\.0\.0') { throw "Unexpected WiX version: $version" }
           $tempRoot = Join-Path $env:RUNNER_TEMP 'wix-preflight-root'
           New-Item -ItemType Directory -Force $tempRoot | Out-Null
           Set-Content -Encoding ascii (Join-Path $tempRoot 'preflight.txt') 'preflight'
           $tempMsi = Join-Path $env:RUNNER_TEMP 'AssemblyNetStudio-preflight.msi'
           & $wix build '.\installer\Product.wxs' -arch x64 -d "ReleaseRoot=$tempRoot" -out $tempMsi
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tempMsi)) { throw 'WiX 5 Product.wxs preflight compile failed.' }
-          Write-Host "WiX preflight compiler: $version"
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tempMsi)) { throw 'WiX 7 Product.wxs preflight compile failed.' }
+          Write-Host "WiX preflight compiler: $version; wix7 EULA accepted."
 
       - name: Acquire MNI305 template and provenance
         shell: pwsh
@@ -166,12 +169,14 @@ jobs:
           Write-Host $dcmOutput
           Write-Host "dcm2niix -v exit=$dcmExit"
           if ($dcmOutput -notmatch 'v1\.0\.20260724') { throw 'Installed dcm2niix version output mismatch.' }
+          $global:LASTEXITCODE = 0
           $u = Start-Process msiexec.exe -ArgumentList @('/x', ('"' + $msi + '"'), '/qn', '/norestart', '/l*v', ('"' + $uninstallLog + '"')) -Wait -PassThru
           if ($u.ExitCode -notin @(0,3010)) { Get-Content $uninstallLog -Tail 250; throw "MSI uninstall failed with $($u.ExitCode)" }
           if (Test-Path $app) { throw 'MSI uninstall left application executable behind.' }
           $sha = (Get-FileHash -Algorithm SHA256 $msi).Hash.ToLowerInvariant()
           "$sha  AssemblyNetStudio-1.0.0-x64.msi" | Set-Content -Encoding ascii '.\dist\AssemblyNetStudio-1.0.0-x64.sha256'
           Write-Host "FINAL_MSI_SHA256=$sha"
+          exit 0
 
       - name: Upload final MSI
         uses: actions/upload-artifact@v4
