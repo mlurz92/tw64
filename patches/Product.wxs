@@ -1,0 +1,12 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="AssemblyNet Studio" Version="1.0.0" Manufacturer="AssemblyNet Studio Research Project"
+           UpgradeCode="4B485617-998B-4D6A-A14A-CF5C0F61F3AD" Scope="perUser" InstallerVersion="500">
+    <SummaryInformation Description="Self-contained research brain volumetry workstation" Manufacturer="AssemblyNet Studio Research Project" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of AssemblyNet Studio is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+    <StandardDirectory Id="PerUserProgramFilesFolder">
+      <Directory Id="INSTALLFOLDER" Name="AssemblyNet Studio" />
+    </StandardDirectory>
+    <Files Include="$(var.ReleaseRoot)\**" Directory="INSTALLFOLDER" />
+  </Package>
+</Wix>
