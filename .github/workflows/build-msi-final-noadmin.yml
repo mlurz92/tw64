@@ -1,0 +1,259 @@
+name: AssemblyNet Studio Final No-Admin MSI
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-msi-final-noadmin.yml'
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 180
+    steps:
+      - name: Checkout build host
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: 'x64'
+
+      - name: Decode and verify recovered source
+        shell: pwsh
+        run: |
+          $parts = Get-ChildItem "$env:GITHUB_WORKSPACE\payload\source.*.b64" | Sort-Object Name
+          if ($parts.Count -ne 13) { throw "Expected 13 source payload chunks, found $($parts.Count)." }
+          $encoded = ($parts | ForEach-Object { Get-Content -Raw $_.FullName }) -join ''
+          $archive = "$env:RUNNER_TEMP\AssemblyNetStudio-source.tar.xz"
+          [IO.File]::WriteAllBytes($archive, [Convert]::FromBase64String($encoded))
+          $sha = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($sha -ne '9d3df42cd51dbaf22e235ebb9bfd0e41b037c9f80fbb542a92e3860937a02230') { throw "Source SHA256 mismatch: $sha" }
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\work" | Out-Null
+          tar.exe -xJf $archive -C "$env:GITHUB_WORKSPACE\work"
+          if ($LASTEXITCODE -ne 0) { throw "Source extraction failed: $LASTEXITCODE" }
+          if (-not (Test-Path "$env:GITHUB_WORKSPACE\work\AssemblyNetStudio\AssemblyNetStudio.sln")) { throw 'Recovered source layout invalid.' }
+          Write-Host "Recovered source verified: $sha"
+
+      - name: Apply tested engine WPF and no-admin installer fixes
+        shell: pwsh
+        working-directory: work/AssemblyNetStudio
+        run: |
+          $spec = 'engine\packaging\AssemblyNetEngine.spec'
+          $text = Get-Content -Raw $spec
+          $oldRoot = 'root = Path(SPECPATH).parent.parent'
+          $newRoot = 'root = Path(SPECPATH).parent'
+          $oldEntry = "[str(root / 'backend_host' / '__main__.py')]"
+          $newEntry = "[str(root / 'packaging' / 'engine_entry.py')]"
+          if (-not $text.Contains($oldRoot)) { throw 'Expected pre-fix spec root not found.' }
+          if (-not $text.Contains($oldEntry)) { throw 'Expected pre-fix spec entrypoint not found.' }
+          $text = $text.Replace($oldRoot, $newRoot).Replace($oldEntry, $newEntry)
+          [IO.File]::WriteAllText((Resolve-Path $spec), $text, (New-Object Text.UTF8Encoding($false)))
+          Copy-Item "$env:GITHUB_WORKSPACE\patches\engine_entry.py" 'engine\packaging\engine_entry.py' -Force
+          Copy-Item "$env:GITHUB_WORKSPACE\patches\test_packaging_spec.py" 'engine\tests\test_packaging_spec.py' -Force
+
+          $vm = 'src\AssemblyNetStudio.App\ViewModels\MainWindowViewModel.cs'
+          $vmText = Get-Content -Raw $vm
+          if ($vmText -notmatch '(?m)^using System\.IO;\s*$') {
+            $vmText = "using System.IO;`r`n" + $vmText
+            [IO.File]::WriteAllText((Resolve-Path $vm), $vmText, (New-Object Text.UTF8Encoding($false)))
+          }
+
+          Copy-Item "$env:GITHUB_WORKSPACE\patches\Product.wxs" 'installer\Product.wxs' -Force
+          Copy-Item "$env:GITHUB_WORKSPACE\patches\build-installer.ps1" 'scripts\build-installer.ps1' -Force
+          Copy-Item "$env:GITHUB_WORKSPACE\patches\test_installer_per_user.py" 'engine\tests\test_installer_per_user.py' -Force
+
+          if ((Get-Content -Raw $spec) -notmatch [regex]::Escape($newRoot)) { throw 'Spec root fix verification failed.' }
+          if ((Get-Content -Raw $spec) -notmatch [regex]::Escape($newEntry)) { throw 'Spec entrypoint fix verification failed.' }
+          if ((Get-Content -Raw $vm) -notmatch '(?m)^using System\.IO;\s*$') { throw 'WPF System.IO import fix verification failed.' }
+          $product = Get-Content -Raw 'installer\Product.wxs'
+          if ($product -notmatch 'Scope="perUser"' -or $product -notmatch 'LocalAppDataFolder' -or $product -notmatch 'Name="Programs"' -or $product -match 'ProgramFiles64Folder') { throw 'Per-user LocalAppData installer patch verification failed.' }
+          $installerScript = Get-Content -Raw 'scripts\build-installer.ps1'
+          if ($installerScript -notmatch 'wix --version 5\.0\.2' -or $installerScript -match '7\.0\.0' -or $installerScript -match 'acceptEula') { throw 'WiX 5.0.2 no-EULA installer patch verification failed.' }
+          python -m pip install pytest==9.0.2
+          if ($LASTEXITCODE -ne 0) { throw 'pytest preflight install failed.' }
+          python -m pytest -q engine\tests\test_packaging_spec.py engine\tests\test_installer_per_user.py
+          if ($LASTEXITCODE -ne 0) { throw 'Packaging/no-admin regression tests failed.' }
+          Write-Host 'Engine, WPF, and no-admin installer fixes staged and verified.'
+
+      - name: Preflight WPF compile
+        shell: pwsh
+        working-directory: work/AssemblyNetStudio
+        run: |
+          dotnet build '.\src\AssemblyNetStudio.App\AssemblyNetStudio.App.csproj' -c Release -p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { throw 'WPF preflight compile failed.' }
+
+      - name: Preflight WiX 5 per-user installer compiler
+        shell: pwsh
+        working-directory: work/AssemblyNetStudio
+        run: |
+          $toolDir = '.tools\wix-preflight'
+          New-Item -ItemType Directory -Force $toolDir | Out-Null
+          dotnet tool install wix --version 5.0.2 --tool-path $toolDir
+          if ($LASTEXITCODE -ne 0) { throw 'WiX 5.0.2 tool install failed.' }
+          $wix = Join-Path $toolDir 'wix.exe'
+          $version = & $wix --version
+          if ($LASTEXITCODE -ne 0 -or ($version -join '') -notmatch '^5\.0\.2') { throw "Unexpected WiX version: $version" }
+          $tempRoot = Join-Path $env:RUNNER_TEMP 'wix-preflight-root'
+          New-Item -ItemType Directory -Force $tempRoot | Out-Null
+          Set-Content -Encoding ascii (Join-Path $tempRoot 'preflight.txt') 'preflight'
+          $tempMsi = Join-Path $env:RUNNER_TEMP 'AssemblyNetStudio-preflight.msi'
+          & $wix build '.\installer\Product.wxs' -arch x64 -d "ReleaseRoot=$tempRoot" -out $tempMsi
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tempMsi)) { throw 'WiX 5 per-user Product.wxs preflight compile failed.' }
+          Write-Host "WiX preflight compiler: $version; per-user MSI compiled without WiX 7 EULA acceptance."
+
+      - name: Acquire MNI305 template and provenance
+        shell: pwsh
+        working-directory: work/AssemblyNetStudio
+        run: |
+          New-Item -ItemType Directory -Force .ci-assets | Out-Null
+          Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/spm/spm/main/canonical/avg305T1.nii' -OutFile '.ci-assets\avg305T1.nii'
+          if ((Get-Item '.ci-assets\avg305T1.nii').Length -ne 902981) { throw 'Unexpected SPM avg305T1.nii size.' }
+          python -c "import gzip,shutil; f=open(r'.ci-assets/avg305T1.nii','rb'); g=gzip.open(r'.ci-assets/avg305T1.nii.gz','wb',compresslevel=9); shutil.copyfileobj(f,g); g.close(); f.close()"
+          Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/spm/spm/main/LICENCE' -OutFile '.ci-assets\SPM-LICENCE.txt'
+          Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/spm/spm/main/spm_templates.md' -OutFile '.ci-assets\spm_templates.md'
+          @"
+          MNI305 TEMPLATE PROVENANCE
+          ==========================
+          Runtime template: canonical/avg305T1.nii from spm/spm main, gzip-compressed without voxel/header modification for this build.
+          Source: https://github.com/spm/spm/blob/main/canonical/avg305T1.nii
+          The SPM license and template provenance follow below.
+          "@ | Set-Content -Encoding utf8 '.ci-assets\MNI305-LICENSE.txt'
+          Get-Content '.ci-assets\SPM-LICENCE.txt' | Add-Content -Encoding utf8 '.ci-assets\MNI305-LICENSE.txt'
+          "`n`nTEMPLATE DESCRIPTION / PROVENANCE`n" | Add-Content -Encoding utf8 '.ci-assets\MNI305-LICENSE.txt'
+          Get-Content '.ci-assets\spm_templates.md' | Add-Content -Encoding utf8 '.ci-assets\MNI305-LICENSE.txt'
+          Get-FileHash -Algorithm SHA256 '.ci-assets\avg305T1.nii.gz'
+
+      - name: Build release MSI
+        shell: pwsh
+        working-directory: work/AssemblyNetStudio
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass -Force
+          .\scripts\build-release.ps1 -Mni305Template '.ci-assets\avg305T1.nii.gz' -Mni305License '.ci-assets\MNI305-LICENSE.txt' -Clean
+
+      - name: Verify real standard-user install runtime and uninstall
+        shell: pwsh
+        working-directory: work/AssemblyNetStudio
+        run: |
+          $msi = (Resolve-Path '.\dist\AssemblyNetStudio-1.0.0-x64.msi').Path
+          $publicDir = 'C:\Users\Public\Documents\AssemblyNetStudioSmoke'
+          New-Item -ItemType Directory -Force $publicDir | Out-Null
+          $publicMsi = Join-Path $publicDir 'AssemblyNetStudio-1.0.0-x64.msi'
+          Copy-Item $msi $publicMsi -Force
+
+          $user = 'AssemblyNetSmoke'
+          $password = "AnSt-$([guid]::NewGuid().ToString('N').Substring(0,12))!a9"
+          Write-Host "::add-mask::$password"
+          net user $user $password /add /y
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create non-admin smoke-test user.' }
+          $admins = (net localgroup Administrators) -join "`n"
+          if ($admins -match "(?m)^$([regex]::Escape($user))$") { throw 'Smoke-test user unexpectedly has administrator membership.' }
+
+          $policyPath = 'HKLM:\Software\Policies\Microsoft\Windows\Installer'
+          $policyExisted = Test-Path $policyPath
+          $disableMsiExisted = $false
+          $oldDisableMsi = $null
+          if ($policyExisted) {
+            $policy = Get-ItemProperty -Path $policyPath -ErrorAction SilentlyContinue
+            if ($null -ne $policy -and $null -ne $policy.DisableMSI) {
+              $disableMsiExisted = $true
+              $oldDisableMsi = [int]$policy.DisableMSI
+            }
+          }
+          New-Item -Path $policyPath -Force | Out-Null
+          Set-ItemProperty -Path $policyPath -Name DisableMSI -Type DWord -Value 0
+          $effectiveDisableMsi = Get-ItemPropertyValue -Path $policyPath -Name DisableMSI
+          if ([int]$effectiveDisableMsi -ne 0) { throw 'Could not relax hosted-runner DisableMSI policy for standard-user package test.' }
+          Write-Host "Hosted-runner DisableMSI policy temporarily set to 0 for package verification; original value: $oldDisableMsi"
+
+          try {
+            Start-Service seclogon -ErrorAction SilentlyContinue
+            $secure = ConvertTo-SecureString $password -AsPlainText -Force
+            $cred = [pscredential]::new("$env:COMPUTERNAME\$user", $secure)
+            $installLog = Join-Path $publicDir 'assemblynet-nonadmin-install.log'
+            $uninstallLog = Join-Path $publicDir 'assemblynet-nonadmin-uninstall.log'
+
+            $p = Start-Process msiexec.exe -Credential $cred -LoadUserProfile -ArgumentList @('/i', ('"' + $publicMsi + '"'), '/qn', '/norestart', '/l*v', ('"' + $installLog + '"')) -Wait -PassThru
+            if ($p.ExitCode -notin @(0,3010)) { Get-Content $installLog -Tail 300; throw "Non-admin MSI install failed with $($p.ExitCode)" }
+            $installText = Get-Content -Raw $installLog
+            if ($installText -notmatch 'MSI_LUA: Package is marked as LUA installation capable with no elevation required') { throw 'Installer log did not confirm LUA/no-elevation capability.' }
+
+            $root = "C:\Users\$user\AppData\Local\Programs\AssemblyNet Studio"
+            $app = Join-Path $root 'AssemblyNetStudio.App.exe'
+            $engine = Join-Path $root 'engine\AssemblyNetEngine.exe'
+            $dcm = Join-Path $root 'tools\dcm2niix\dcm2niix.exe'
+            foreach ($path in @($app,$engine,$dcm)) { if (-not (Test-Path $path)) { throw "Non-admin installed file missing: $path" } }
+
+            $capOut = Join-Path $publicDir 'installed-engine-capabilities.json'
+            $capErr = Join-Path $publicDir 'installed-engine-capabilities.err.txt'
+            $ep = Start-Process -FilePath $engine -Credential $cred -LoadUserProfile -ArgumentList '--capabilities' -Wait -PassThru -RedirectStandardOutput $capOut -RedirectStandardError $capErr
+            if ($ep.ExitCode -ne 0) { Get-Content $capErr -ErrorAction SilentlyContinue; throw "Installed engine capabilities exited $($ep.ExitCode) as non-admin user" }
+            $capRaw = Get-Content -Raw $capOut
+            $cap = $capRaw | ConvertFrom-Json
+            if ($cap.protocolVersion -ne 1 -or $cap.labelCount -ne 133 -or $cap.engineName -ne 'MONAI WholeBrain UNesT' -or -not $cap.cpuSupported -or -not $cap.researchUseOnly -or $cap.originalAssemblyNetRuntime) { throw 'Installed engine capability contract failed under non-admin user.' }
+            $capRaw | Set-Content -Encoding utf8 '.\dist\installed-engine-capabilities.json'
+
+            $dcmOut = Join-Path $publicDir 'dcm2niix-version.txt'
+            $dcmErr = Join-Path $publicDir 'dcm2niix-version.err.txt'
+            $dp = Start-Process -FilePath $dcm -Credential $cred -LoadUserProfile -ArgumentList '-v' -Wait -PassThru -RedirectStandardOutput $dcmOut -RedirectStandardError $dcmErr
+            $dcmOutput = ((Get-Content -Raw $dcmOut -ErrorAction SilentlyContinue) + "`n" + (Get-Content -Raw $dcmErr -ErrorAction SilentlyContinue))
+            $dcmOutput | Set-Content -Encoding utf8 '.\dist\dcm2niix-version.txt'
+            if ($dcmOutput -notmatch 'v1\.0\.20260724') { throw 'Installed dcm2niix version output mismatch under non-admin user.' }
+
+            $u = Start-Process msiexec.exe -Credential $cred -LoadUserProfile -ArgumentList @('/x', ('"' + $publicMsi + '"'), '/qn', '/norestart', '/l*v', ('"' + $uninstallLog + '"')) -Wait -PassThru
+            if ($u.ExitCode -notin @(0,3010)) { Get-Content $uninstallLog -Tail 300; throw "Non-admin MSI uninstall failed with $($u.ExitCode)" }
+            if (Test-Path $app) { throw 'Non-admin MSI uninstall left application executable behind.' }
+          }
+          finally {
+            if ($disableMsiExisted) {
+              Set-ItemProperty -Path $policyPath -Name DisableMSI -Type DWord -Value $oldDisableMsi
+            } else {
+              Remove-ItemProperty -Path $policyPath -Name DisableMSI -ErrorAction SilentlyContinue
+            }
+            net user $user /delete | Out-Null
+          }
+
+          $sha = (Get-FileHash -Algorithm SHA256 $msi).Hash.ToLowerInvariant()
+          "$sha  AssemblyNetStudio-1.0.0-x64.msi" | Set-Content -Encoding ascii '.\dist\AssemblyNetStudio-1.0.0-x64.sha256'
+          @"
+          Installation scope: per-user
+          Elevation required by package: no
+          Verification account: local standard user, not member of Administrators
+          Hosted-runner policy: DisableMSI temporarily changed only to permit the standard-user MSI test, then restored
+          Windows Installer evidence: MSI_LUA package marked installation capable with no elevation required
+          Install root: %LOCALAPPDATA%\Programs\AssemblyNet Studio
+          App runtime: self-contained .NET 8
+          Engine runtime: bundled PyInstaller/Python/MONAI/PyTorch
+          dcm2niix: bundled v1.0.20260724
+          FINAL_MSI_SHA256=$sha
+          "@ | Set-Content -Encoding utf8 '.\dist\nonadmin-install-verification.txt'
+          Write-Host "FINAL_MSI_SHA256=$sha"
+
+      - name: Upload final MSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: AssemblyNetStudio-1.0.0-x64-final-noadmin
+          path: |
+            work/AssemblyNetStudio/dist/AssemblyNetStudio-1.0.0-x64.msi
+            work/AssemblyNetStudio/dist/AssemblyNetStudio-1.0.0-x64.sha256
+            work/AssemblyNetStudio/dist/SHA256SUMS
+            work/AssemblyNetStudio/dist/engine-capabilities.json
+            work/AssemblyNetStudio/dist/installed-engine-capabilities.json
+            work/AssemblyNetStudio/dist/dcm2niix-version.txt
+            work/AssemblyNetStudio/dist/nonadmin-install-verification.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
