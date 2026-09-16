@@ -36,14 +36,12 @@ jobs:
       - name: Decode and verify source package
         shell: pwsh
         run: |
-          $parts = Get-ChildItem "$env:GITHUB_WORKSPACE\payload\source.*.b64" | Sort-Object Name
-          if ($parts.Count -ne 13) { throw "Expected 13 source payload chunks, found $($parts.Count)." }
-          $encoded = ($parts | ForEach-Object { Get-Content -Raw $_.FullName }) -join ''
+          $encoded = Get-Content -Raw "$env:GITHUB_WORKSPACE\payload\source-fixed.b64"
           $bytes = [Convert]::FromBase64String($encoded)
           $archive = "$env:RUNNER_TEMP\AssemblyNetStudio-source.tar.xz"
           [IO.File]::WriteAllBytes($archive, $bytes)
           $sha = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
-          if ($sha -ne '9d3df42cd51dbaf22e235ebb9bfd0e41b037c9f80fbb542a92e3860937a02230') { throw "Source payload SHA256 mismatch: $sha" }
+          if ($sha -ne '343882320ccbf0bfd3f56119f5e9c4add90ffefb352c0eee4d2be8c35a5784d6') { throw "Source payload SHA256 mismatch: $sha" }
           New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\work" | Out-Null
           tar.exe -xJf $archive -C "$env:GITHUB_WORKSPACE\work"
           if ($LASTEXITCODE -ne 0) { throw "tar extraction failed: $LASTEXITCODE" }
