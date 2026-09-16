@@ -1,0 +1,140 @@
+name: AssemblyNet Studio Final Windows MSI
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-msi-final.yml'
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 180
+    steps:
+      - name: Checkout build host
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: 'x64'
+
+      - name: Decode and verify recovered source
+        shell: pwsh
+        run: |
+          $parts = Get-ChildItem "$env:GITHUB_WORKSPACE\payload\source.*.b64" | Sort-Object Name
+          if ($parts.Count -ne 13) { throw "Expected 13 source payload chunks, found $($parts.Count)." }
+          $encoded = ($parts | ForEach-Object { Get-Content -Raw $_.FullName }) -join ''
+          $archive = "$env:RUNNER_TEMP\AssemblyNetStudio-source.tar.xz"
+          [IO.File]::WriteAllBytes($archive, [Convert]::FromBase64String($encoded))
+          $sha = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($sha -ne '9d3df42cd51dbaf22e235ebb9bfd0e41b037c9f80fbb542a92e3860937a02230') { throw "Source SHA256 mismatch: $sha" }
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\work" | Out-Null
+          tar.exe -xJf $archive -C "$env:GITHUB_WORKSPACE\work"
+          if ($LASTEXITCODE -ne 0) { throw "Source extraction failed: $LASTEXITCODE" }
+          if (-not (Test-Path "$env:GITHUB_WORKSPACE\work\AssemblyNetStudio\AssemblyNetStudio.sln")) { throw 'Recovered source layout invalid.' }
+          Write-Host "Recovered source verified: $sha"
+
+      - name: Apply tested frozen-engine fixes
+        shell: pwsh
+        working-directory: work/AssemblyNetStudio
+        run: |
+          $spec = 'engine\packaging\AssemblyNetEngine.spec'
+          $text = Get-Content -Raw $spec
+          $oldRoot = 'root = Path(SPECPATH).parent.parent'
+          $newRoot = 'root = Path(SPECPATH).parent'
+          $oldEntry = "[str(root / 'backend_host' / '__main__.py')]"
+          $newEntry = "[str(root / 'packaging' / 'engine_entry.py')]"
+          if (-not $text.Contains($oldRoot)) { throw 'Expected pre-fix spec root not found.' }
+          if (-not $text.Contains($oldEntry)) { throw 'Expected pre-fix spec entrypoint not found.' }
+          $text = $text.Replace($oldRoot, $newRoot).Replace($oldEntry, $newEntry)
+          [IO.File]::WriteAllText((Resolve-Path $spec), $text, (New-Object Text.UTF8Encoding($false)))
+          Copy-Item "$env:GITHUB_WORKSPACE\patches\engine_entry.py" 'engine\packaging\engine_entry.py' -Force
+          Copy-Item "$env:GITHUB_WORKSPACE\patches\test_packaging_spec.py" 'engine\tests\test_packaging_spec.py' -Force
+          if ((Get-Content -Raw $spec) -notmatch [regex]::Escape($newRoot)) { throw 'Spec root fix verification failed.' }
+          if ((Get-Content -Raw $spec) -notmatch [regex]::Escape($newEntry)) { throw 'Spec entrypoint fix verification failed.' }
+          if (-not (Test-Path 'engine\packaging\engine_entry.py')) { throw 'Package-aware engine entrypoint missing.' }
+          Write-Host 'Frozen-engine fixes staged and verified.'
+
+      - name: Acquire MNI305 template and provenance
+        shell: pwsh
+        working-directory: work/AssemblyNetStudio
+        run: |
+          New-Item -ItemType Directory -Force .ci-assets | Out-Null
+          Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/spm/spm/main/canonical/avg305T1.nii' -OutFile '.ci-assets\avg305T1.nii'
+          if ((Get-Item '.ci-assets\avg305T1.nii').Length -ne 902981) { throw 'Unexpected SPM avg305T1.nii size.' }
+          python -c "import gzip,shutil; f=open(r'.ci-assets/avg305T1.nii','rb'); g=gzip.open(r'.ci-assets/avg305T1.nii.gz','wb',compresslevel=9); shutil.copyfileobj(f,g); g.close(); f.close()"
+          Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/spm/spm/main/LICENCE' -OutFile '.ci-assets\SPM-LICENCE.txt'
+          Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/spm/spm/main/spm_templates.md' -OutFile '.ci-assets\spm_templates.md'
+          @"
+          MNI305 TEMPLATE PROVENANCE
+          ==========================
+          Runtime template: canonical/avg305T1.nii from spm/spm main, gzip-compressed without voxel/header modification for this build.
+          Source: https://github.com/spm/spm/blob/main/canonical/avg305T1.nii
+          The SPM license and template provenance follow below.
+          "@ | Set-Content -Encoding utf8 '.ci-assets\MNI305-LICENSE.txt'
+          Get-Content '.ci-assets\SPM-LICENCE.txt' | Add-Content -Encoding utf8 '.ci-assets\MNI305-LICENSE.txt'
+          "`n`nTEMPLATE DESCRIPTION / PROVENANCE`n" | Add-Content -Encoding utf8 '.ci-assets\MNI305-LICENSE.txt'
+          Get-Content '.ci-assets\spm_templates.md' | Add-Content -Encoding utf8 '.ci-assets\MNI305-LICENSE.txt'
+          Get-FileHash -Algorithm SHA256 '.ci-assets\avg305T1.nii.gz'
+
+      - name: Build release MSI
+        shell: pwsh
+        working-directory: work/AssemblyNetStudio
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass -Force
+          .\scripts\build-release.ps1 -Mni305Template '.ci-assets\avg305T1.nii.gz' -Mni305License '.ci-assets\MNI305-LICENSE.txt' -Clean
+
+      - name: Verify MSI install runtime and uninstall
+        shell: pwsh
+        working-directory: work/AssemblyNetStudio
+        run: |
+          $msi = (Resolve-Path '.\dist\AssemblyNetStudio-1.0.0-x64.msi').Path
+          $installLog = Join-Path $env:RUNNER_TEMP 'assemblynet-install.log'
+          $uninstallLog = Join-Path $env:RUNNER_TEMP 'assemblynet-uninstall.log'
+          $p = Start-Process msiexec.exe -ArgumentList @('/i', ('"' + $msi + '"'), '/qn', '/norestart', '/l*v', ('"' + $installLog + '"')) -Wait -PassThru
+          if ($p.ExitCode -notin @(0,3010)) { Get-Content $installLog -Tail 250; throw "MSI install failed with $($p.ExitCode)" }
+          $root = Join-Path $env:ProgramFiles 'AssemblyNet Studio'
+          $app = Join-Path $root 'AssemblyNetStudio.App.exe'
+          $engine = Join-Path $root 'engine\AssemblyNetEngine.exe'
+          $dcm = Join-Path $root 'tools\dcm2niix\dcm2niix.exe'
+          foreach ($path in @($app,$engine,$dcm)) { if (-not (Test-Path $path)) { throw "Installed file missing: $path" } }
+          $capRaw = & $engine --capabilities
+          if ($LASTEXITCODE -ne 0) { throw "Installed engine capabilities exited $LASTEXITCODE" }
+          $cap = $capRaw | ConvertFrom-Json
+          if ($cap.protocolVersion -ne 1 -or $cap.labelCount -ne 133 -or $cap.engineName -ne 'MONAI WholeBrain UNesT' -or -not $cap.cpuSupported -or -not $cap.researchUseOnly -or $cap.originalAssemblyNetRuntime) { throw 'Installed engine capability contract failed.' }
+          $capRaw | Set-Content -Encoding utf8 '.\dist\installed-engine-capabilities.json'
+          & $dcm -v 2>&1 | Tee-Object -FilePath (Join-Path $env:RUNNER_TEMP 'dcm2niix-version.txt')
+          $u = Start-Process msiexec.exe -ArgumentList @('/x', ('"' + $msi + '"'), '/qn', '/norestart', '/l*v', ('"' + $uninstallLog + '"')) -Wait -PassThru
+          if ($u.ExitCode -notin @(0,3010)) { Get-Content $uninstallLog -Tail 250; throw "MSI uninstall failed with $($u.ExitCode)" }
+          if (Test-Path $app) { throw 'MSI uninstall left application executable behind.' }
+          $sha = (Get-FileHash -Algorithm SHA256 $msi).Hash.ToLowerInvariant()
+          "$sha  AssemblyNetStudio-1.0.0-x64.msi" | Set-Content -Encoding ascii '.\dist\AssemblyNetStudio-1.0.0-x64.sha256'
+          Write-Host "FINAL_MSI_SHA256=$sha"
+
+      - name: Upload final MSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: AssemblyNetStudio-1.0.0-x64-final
+          path: |
+            work/AssemblyNetStudio/dist/AssemblyNetStudio-1.0.0-x64.msi
+            work/AssemblyNetStudio/dist/AssemblyNetStudio-1.0.0-x64.sha256
+            work/AssemblyNetStudio/dist/SHA256SUMS
+            work/AssemblyNetStudio/dist/engine-capabilities.json
+            work/AssemblyNetStudio/dist/installed-engine-capabilities.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
