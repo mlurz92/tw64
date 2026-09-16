@@ -4,8 +4,10 @@
     <SummaryInformation Description="Self-contained research brain volumetry workstation" Manufacturer="AssemblyNet Studio Research Project" />
     <MajorUpgrade DowngradeErrorMessage="A newer version of AssemblyNet Studio is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
-    <StandardDirectory Id="PerUserProgramFilesFolder">
-      <Directory Id="INSTALLFOLDER" Name="AssemblyNet Studio" />
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="LocalProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="AssemblyNet Studio" />
+      </Directory>
     </StandardDirectory>
     <Files Include="$(var.ReleaseRoot)\**" Directory="INSTALLFOLDER" />
   </Package>
