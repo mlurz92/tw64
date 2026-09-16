@@ -36,17 +36,35 @@ jobs:
       - name: Decode and verify source package
         shell: pwsh
         run: |
-          $encoded = Get-Content -Raw "$env:GITHUB_WORKSPACE\payload\source-fixed.b64"
+          $parts = Get-ChildItem "$env:GITHUB_WORKSPACE\payload\source.*.b64" | Sort-Object Name
+          if ($parts.Count -ne 13) { throw "Expected 13 source payload chunks, found $($parts.Count)." }
+          $encoded = ($parts | ForEach-Object { Get-Content -Raw $_.FullName }) -join ''
           $bytes = [Convert]::FromBase64String($encoded)
           $archive = "$env:RUNNER_TEMP\AssemblyNetStudio-source.tar.xz"
           [IO.File]::WriteAllBytes($archive, $bytes)
           $sha = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
-          if ($sha -ne '343882320ccbf0bfd3f56119f5e9c4add90ffefb352c0eee4d2be8c35a5784d6') { throw "Source payload SHA256 mismatch: $sha" }
+          if ($sha -ne '9d3df42cd51dbaf22e235ebb9bfd0e41b037c9f80fbb542a92e3860937a02230') { throw "Source payload SHA256 mismatch: $sha" }
           New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\work" | Out-Null
           tar.exe -xJf $archive -C "$env:GITHUB_WORKSPACE\work"
           if ($LASTEXITCODE -ne 0) { throw "tar extraction failed: $LASTEXITCODE" }
           if (-not (Test-Path "$env:GITHUB_WORKSPACE\work\AssemblyNetStudio\AssemblyNetStudio.sln")) { throw 'Source archive layout invalid.' }
           Write-Host "Source payload verified: $sha"
+
+      - name: Apply and verify PyInstaller packaging fix
+        shell: pwsh
+        working-directory: work/AssemblyNetStudio
+        run: |
+          $spec = 'engine\packaging\AssemblyNetEngine.spec'
+          $text = Get-Content -Raw $spec
+          $old = 'root = Path(SPECPATH).parent.parent'
+          $new = 'root = Path(SPECPATH).parent'
+          if (-not $text.Contains($old)) { throw 'Expected pre-fix PyInstaller root expression not found.' }
+          $text = $text.Replace($old, $new)
+          [IO.File]::WriteAllText((Resolve-Path $spec), $text, (New-Object Text.UTF8Encoding($false)))
+          $testBytes = [Convert]::FromBase64String('ZnJvbSBfX2Z1dHVyZV9fIGltcG9ydCBhbm5vdGF0aW9ucwoKaW1wb3J0IHN5cwppbXBvcnQgdHlwZXMKZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCgoKZGVmIHRlc3RfcHlpbnN0YWxsZXJfc3BlY19lbnRyeXBvaW50X3Jlc29sdmVzX2luc2lkZV9lbmdpbmUobW9ua2V5cGF0Y2gpOgogICAgIiIiUmVncmVzc2lvbjogdGhlIHNwZWMgbXVzdCBwYWNrYWdlIGVuZ2luZS9iYWNrZW5kX2hvc3QvX19tYWluX18ucHkuIiIiCiAgICByZXBvX3Jvb3QgPSBQYXRoKF9fZmlsZV9fKS5yZXNvbHZlKCkucGFyZW50c1syXQogICAgc3BlY19wYXRoID0gcmVwb19yb290IC8gImVuZ2luZSIgLyAicGFja2FnaW5nIiAvICJBc3NlbWJseU5ldEVuZ2luZS5zcGVjIgogICAgZXhwZWN0ZWRfZW50cnkgPSAocmVwb19yb290IC8gImVuZ2luZSIgLyAiYmFja2VuZF9ob3N0IiAvICJfX21haW5fXy5weSIpLnJlc29sdmUoKQogICAgY2FwdHVyZWQ6IGRpY3Rbc3RyLCBvYmplY3RdID0ge30KCiAgICBob29rcyA9IHR5cGVzLk1vZHVsZVR5cGUoIlB5SW5zdGFsbGVyLnV0aWxzLmhvb2tzIikKICAgIGhvb2tzLmNvbGxlY3RfYWxsID0gbGFtYmRhIF9wYWNrYWdlOiAoW10sIFtdLCBbXSkKICAgIG1vbmtleXBhdGNoLnNldGl0ZW0oc3lzLm1vZHVsZXMsICJQeUluc3RhbGxlciIsIHR5cGVzLk1vZHVsZVR5cGUoIlB5SW5zdGFsbGVyIikpCiAgICBtb25rZXlwYXRjaC5zZXRpdGVtKHN5cy5tb2R1bGVzLCAiUHlJbnN0YWxsZXIudXRpbHMiLCB0eXBlcy5Nb2R1bGVUeXBlKCJQeUluc3RhbGxlci51dGlscyIpKQogICAgbW9ua2V5cGF0Y2guc2V0aXRlbShzeXMubW9kdWxlcywgIlB5SW5zdGFsbGVyLnV0aWxzLmhvb2tzIiwgaG9va3MpCgogICAgZGVmIGFuYWx5c2lzKHNjcmlwdHMsICoqX2t3YXJncyk6CiAgICAgICAgY2FwdHVyZWRbImVudHJ5Il0gPSBQYXRoKHNjcmlwdHNbMF0pLnJlc29sdmUoKQogICAgICAgIHJldHVybiB0eXBlcy5TaW1wbGVOYW1lc3BhY2UocHVyZT1bXSwgc2NyaXB0cz1bXSwgYmluYXJpZXM9W10sIGRhdGFzPVtdKQoKICAgIGdsb2JhbHNfZm9yX3NwZWMgPSB7CiAgICAgICAgIlNQRUNQQVRIIjogc3RyKHNwZWNfcGF0aC5wYXJlbnQpLAogICAgICAgICJBbmFseXNpcyI6IGFuYWx5c2lzLAogICAgICAgICJQWVoiOiBsYW1iZGEgX3B1cmU6IG9iamVjdCgpLAogICAgICAgICJFWEUiOiBsYW1iZGEgKl9hcmdzLCAqKl9rd2FyZ3M6IG9iamVjdCgpLAogICAgICAgICJDT0xMRUNUIjogbGFtYmRhICpfYXJncywgKipfa3dhcmdzOiBvYmplY3QoKSwKICAgIH0KICAgIGNvZGUgPSBjb21waWxlKHNwZWNfcGF0aC5yZWFkX3RleHQoZW5jb2Rpbmc9InV0Zi04IiksIHN0cihzcGVjX3BhdGgpLCAiZXhlYyIpCiAgICBleGVjKGNvZGUsIGdsb2JhbHNfZm9yX3NwZWMpCgogICAgYXNzZXJ0IGNhcHR1cmVkWyJlbnRyeSJdID09IGV4cGVjdGVkX2VudHJ5CiAgICBhc3NlcnQgZXhwZWN0ZWRfZW50cnkuaXNfZmlsZSgpCg==')
+          [IO.File]::WriteAllBytes((Join-Path (Get-Location) 'engine\tests\test_packaging_spec.py'), $testBytes)
+          if ((Get-Content -Raw $spec) -notmatch [regex]::Escape($new)) { throw 'PyInstaller packaging fix verification failed.' }
+          Write-Host 'Verified packaging fix staged; regression test added.'
 
       - name: Acquire MNI305 template and provenance
         shell: pwsh
