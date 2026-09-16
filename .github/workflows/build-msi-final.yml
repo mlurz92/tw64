@@ -84,6 +84,8 @@ jobs:
           if ($product -notmatch 'Scope="perUser"' -or $product -notmatch 'PerUserProgramFilesFolder' -or $product -match 'ProgramFiles64Folder') { throw 'Per-user installer patch verification failed.' }
           $installerScript = Get-Content -Raw 'scripts\build-installer.ps1'
           if ($installerScript -notmatch '-acceptEula\s+wix7') { throw 'WiX 7 EULA direct-acceptance patch verification failed.' }
+          python -m pip install pytest==9.0.2
+          if ($LASTEXITCODE -ne 0) { throw 'pytest preflight install failed.' }
           python -m pytest -q engine\tests\test_packaging_spec.py engine\tests\test_installer_per_user.py
           if ($LASTEXITCODE -ne 0) { throw 'Packaging/no-admin regression tests failed.' }
           Write-Host 'Packaging, WPF, and no-admin installer fixes staged and verified.'
