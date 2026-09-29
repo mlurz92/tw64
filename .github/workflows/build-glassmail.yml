@@ -55,7 +55,7 @@ jobs:
         shell: pwsh
         working-directory: ${{ env.GLASSMAIL_ROOT }}
         run: |
-          python scripts/static-verify.py
+          python -X utf8 scripts/static-verify.py
 
       - name: Restore
         shell: pwsh
