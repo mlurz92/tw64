@@ -1,0 +1,187 @@
+name: GlassMail Windows Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - glassmail-release-20260929
+    paths:
+      - '.github/workflows/build-glassmail.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 120
+    steps:
+      - name: Checkout isolated build branch
+        uses: actions/checkout@v4
+
+      - name: Recover GlassMail source payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $parts = Get-ChildItem "$env:GITHUB_WORKSPACE\payload\source.*.b64" | Sort-Object Name
+          if ($parts.Count -ne 13) { throw "Expected 13 GlassMail payload chunks, found $($parts.Count)." }
+          $encoded = ($parts | ForEach-Object { Get-Content -Raw $_.FullName }) -join ''
+          $archive = "$env:RUNNER_TEMP\GlassMail-source.tar.xz"
+          [IO.File]::WriteAllBytes($archive, [Convert]::FromBase64String($encoded))
+          Write-Host "Payload SHA256: $((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant())"
+          $work = "$env:GITHUB_WORKSPACE\glassmail-work"
+          New-Item -ItemType Directory -Force $work | Out-Null
+          tar.exe -xJf $archive -C $work
+          if ($LASTEXITCODE -ne 0) { throw "Source extraction failed: $LASTEXITCODE" }
+          $solution = Get-ChildItem $work -Recurse -Filter GlassMail.slnx | Select-Object -First 1
+          if (-not $solution) { throw 'GlassMail.slnx not found after extraction.' }
+          "GLASSMAIL_ROOT=$($solution.Directory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "GlassMail root: $($solution.Directory.FullName)"
+
+      - name: Setup .NET 10.0.401
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.401'
+
+      - name: Verify toolchain
+        shell: pwsh
+        run: |
+          dotnet --info
+          python --version
+
+      - name: Static verification
+        shell: pwsh
+        working-directory: ${{ env.GLASSMAIL_ROOT }}
+        run: |
+          python scripts/static-verify.py
+
+      - name: Restore
+        shell: pwsh
+        working-directory: ${{ env.GLASSMAIL_ROOT }}
+        run: |
+          dotnet restore GlassMail.slnx
+
+      - name: Build Release
+        shell: pwsh
+        working-directory: ${{ env.GLASSMAIL_ROOT }}
+        run: |
+          dotnet build GlassMail.slnx -c Release --no-restore
+
+      - name: Test Release
+        shell: pwsh
+        working-directory: ${{ env.GLASSMAIL_ROOT }}
+        run: |
+          dotnet test GlassMail.slnx -c Release --no-build
+
+      - name: Publish self-contained win-x64
+        shell: pwsh
+        working-directory: ${{ env.GLASSMAIL_ROOT }}
+        run: |
+          $out = Join-Path (Get-Location) 'artifacts\publish\win-x64'
+          Remove-Item $out -Recurse -Force -ErrorAction SilentlyContinue
+          dotnet publish src/GlassMail.App/GlassMail.App.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:PublishReadyToRun=true -o $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path (Join-Path $out 'GlassMail.App.exe'))) { throw 'Published GlassMail.App.exe missing.' }
+
+      - name: Bundle WebView2 Evergreen Standalone x64
+        shell: pwsh
+        working-directory: ${{ env.GLASSMAIL_ROOT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $assetDir = Join-Path (Get-Location) 'Installer\assets'
+          New-Item -ItemType Directory -Force $assetDir | Out-Null
+          $wv2 = Join-Path $assetDir 'MicrosoftEdgeWebView2RuntimeInstallerX64.exe'
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://go.microsoft.com/fwlink/?linkid=2124701' -OutFile $wv2
+          $size = (Get-Item $wv2).Length
+          if ($size -lt 50MB) { throw "WebView2 standalone installer unexpectedly small: $size" }
+          $hash = (Get-FileHash $wv2 -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "WebView2 size: $size"
+          Write-Host "WebView2 SHA256: $hash"
+          "GLASSMAIL_WV2_SHA256=$hash" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Patch installer for bundled WebView2 and strict per-user install
+        shell: pwsh
+        working-directory: ${{ env.GLASSMAIL_ROOT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iss = Join-Path (Get-Location) 'Installer\GlassMail.iss'
+          $text = Get-Content -Raw $iss
+          if ($text -notmatch 'PrivilegesRequired=lowest') { throw 'Installer is not configured for non-admin install.' }
+          if ($text -notmatch 'DefaultDirName=\{localappdata\}\\Programs\\GlassMail') { throw 'Installer target is not LocalAppData Programs.' }
+          if ($text -notmatch 'MicrosoftEdgeWebView2RuntimeInstallerX64\.exe') {
+            $needle = '[Files]' + [Environment]::NewLine
+            $insert = '[Files]' + [Environment]::NewLine + 'Source: "assets\MicrosoftEdgeWebView2RuntimeInstallerX64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall' + [Environment]::NewLine
+            $text = $text.Replace($needle, $insert)
+            $runNeedle = '[Run]' + [Environment]::NewLine
+            $runInsert = '[Run]' + [Environment]::NewLine + 'Filename: "{tmp}\MicrosoftEdgeWebView2RuntimeInstallerX64.exe"; Parameters: "/silent /install"; StatusMsg: "Microsoft Edge WebView2 Runtime wird eingerichtet..."; Flags: waituntilterminated runhidden' + [Environment]::NewLine
+            $text = $text.Replace($runNeedle, $runInsert)
+            [IO.File]::WriteAllText($iss, $text, [Text.UTF8Encoding]::new($false))
+          }
+          $final = Get-Content -Raw $iss
+          if ($final -notmatch 'MicrosoftEdgeWebView2RuntimeInstallerX64\.exe') { throw 'WebView2 bundle patch failed.' }
+          if ($final -notmatch 'PrivilegesRequired=lowest') { throw 'No-admin directive lost.' }
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Compile single-file installer
+        shell: pwsh
+        working-directory: ${{ env.GLASSMAIL_ROOT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iscc = Get-ChildItem @("$env:ProgramFiles(x86)\Inno Setup *\ISCC.exe", "$env:ProgramFiles\Inno Setup *\ISCC.exe") -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $iscc) { $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue }
+          if (-not $iscc) { throw 'ISCC.exe not found after Inno Setup installation.' }
+          New-Item -ItemType Directory -Force 'artifacts\installer' | Out-Null
+          & $iscc.FullName 'Installer\GlassMail.iss'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $installer = Get-ChildItem 'artifacts\installer' -Filter 'GlassMail-Setup-*-x64.exe' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $installer) { throw 'Compiled GlassMail installer missing.' }
+          $hash = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $version = (Get-Content 'eng\version.json' -Raw | ConvertFrom-Json).version
+          [pscustomobject]@{
+            Product='GlassMail'
+            Version=$version
+            Installer=$installer.Name
+            InstallerSha256=$hash
+            InstallerSizeBytes=$installer.Length
+            DotNetSdk=(dotnet --version)
+            WebView2Deployment='EvergreenStandaloneX64'
+            WebView2Sha256=$env:GLASSMAIL_WV2_SHA256
+            BuildRunner='windows-2025'
+            Commit=$env:GITHUB_SHA
+          } | ConvertTo-Json | Set-Content 'artifacts\release-manifest.json'
+          Write-Host "Installer: $($installer.FullName)"
+          Write-Host "Installer size: $($installer.Length)"
+          Write-Host "Installer SHA256: $hash"
+
+      - name: Validate installer metadata
+        shell: pwsh
+        working-directory: ${{ env.GLASSMAIL_ROOT }}
+        run: |
+          $iss = Get-Content -Raw 'Installer\GlassMail.iss'
+          foreach ($required in @(
+            'PrivilegesRequired=lowest',
+            'DefaultDirName={localappdata}\Programs\GlassMail',
+            'MicrosoftEdgeWebView2RuntimeInstallerX64.exe',
+            '/silent /install'
+          )) {
+            if (-not $iss.Contains($required)) { throw "Missing installer contract: $required" }
+          }
+          $manifest = Get-Content 'artifacts\release-manifest.json' -Raw | ConvertFrom-Json
+          if (-not $manifest.InstallerSha256) { throw 'Installer hash missing.' }
+          if ($manifest.InstallerSizeBytes -lt 50MB) { throw 'Installer unexpectedly small; bundled runtime may be missing.' }
+          Get-Content 'artifacts\release-manifest.json'
+
+      - name: Upload GlassMail release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GlassMail-Windows-x64-Release
+          path: |
+            ${{ env.GLASSMAIL_ROOT }}/artifacts/installer/GlassMail-Setup-*-x64.exe
+            ${{ env.GLASSMAIL_ROOT }}/artifacts/release-manifest.json
+          if-no-files-found: error
+          retention-days: 7
