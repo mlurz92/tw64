@@ -23,12 +23,14 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $parts = Get-ChildItem "$env:GITHUB_WORKSPACE\payload\source.*.b64" | Sort-Object Name
-          if ($parts.Count -ne 13) { throw "Expected 13 GlassMail payload chunks, found $($parts.Count)." }
+          $parts = Get-ChildItem "$env:GITHUB_WORKSPACE\payload\glassmail-v2\source.*.b64" | Sort-Object Name
+          if ($parts.Count -ne 6) { throw "Expected 6 GlassMail v2 payload chunks, found $($parts.Count)." }
           $encoded = ($parts | ForEach-Object { Get-Content -Raw $_.FullName }) -join ''
           $archive = "$env:RUNNER_TEMP\GlassMail-source.tar.xz"
           [IO.File]::WriteAllBytes($archive, [Convert]::FromBase64String($encoded))
-          Write-Host "Payload SHA256: $((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant())"
+          $payloadSha = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "Payload SHA256: $payloadSha"
+          if ($payloadSha -ne '2ad2136cf3aeed49edd2a5af71626fc5a6277947e68c3bc304617d21fe1c5571') { throw "GlassMail source payload SHA256 mismatch: $payloadSha" }
           $work = "$env:GITHUB_WORKSPACE\glassmail-work"
           New-Item -ItemType Directory -Force $work | Out-Null
           tar.exe -xJf $archive -C $work
