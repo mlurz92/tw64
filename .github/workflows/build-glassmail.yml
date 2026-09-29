@@ -30,7 +30,7 @@ jobs:
           [IO.File]::WriteAllBytes($archive, [Convert]::FromBase64String($encoded))
           $payloadSha = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           Write-Host "Payload SHA256: $payloadSha"
-          if ($payloadSha -ne '2c6c86a6fca3e5eeb8dc979ba5ea306f97b9f843ebb3106aece7f4b18698cfbb') { throw "GlassMail source payload SHA256 mismatch: $payloadSha" }
+          if ($payloadSha -ne '39b764342224a14456f3464b4d34625b743333efb7dc1f36c91c9900060dfef7') { throw "GlassMail source payload SHA256 mismatch: $payloadSha" }
           $work = "$env:GITHUB_WORKSPACE\glassmail-work"
           New-Item -ItemType Directory -Force $work | Out-Null
           tar.exe -xJf $archive -C $work
